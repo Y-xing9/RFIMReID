@@ -1,12 +1,10 @@
-from torchsummary import summary
-
-from loss.make_loss_lpm import make_loss
-from model.make_model_lpm import make_model
-from processor.processor_lpm import do_train
 from utils.logger import setup_logger
 from datasets import make_dataloader
+from model import make_model
 from solver import make_optimizer
 from solver.scheduler_factory import create_scheduler
+from loss import make_loss
+from processor import do_train
 import random
 import torch
 import numpy as np
@@ -30,7 +28,7 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(description="ReID Baseline Training")
     parser.add_argument(
-        "--config_file", default="configs/MSMT17/vit_jpms.yml", help="path to config file", type=str
+        "--config_file", default="configs/Market/vit_base.yml", help="path to config file", type=str
     )
 
     parser.add_argument("opts", help="Modify config options using the command-line", default=None,
@@ -70,23 +68,6 @@ if __name__ == '__main__':
     train_loader, train_loader_normal, val_loader, num_query, num_classes, camera_num, view_num = make_dataloader(cfg)
 
     model = make_model(cfg, num_class=num_classes, camera_num=camera_num, view_num = view_num)
-    # 方法2：使用 torchsummary 显示每层输入输出形状（需指定输入尺寸）
-    # 注意：输入尺寸需根据实际任务调整（示例为图像输入：[通道数, 高度, 宽度]）
-    input_size = (3, 256, 128)  # 示例尺寸，需根据你的数据调整
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)  # 模型需先加载到设备（CPU/GPU）
-    try:
-        summary(model, input_size=input_size, device=device.type)
-    except Exception as e:
-        print(f"\nWarning: torchsummary 输出失败，可能是输入尺寸不匹配或未安装库。错误信息：{e}")
-        print("提示：可尝试调整 input_size 或安装 torchsummary（pip install torchsummary）")
-
-    # 方法3：统计模型参数（总参数量、可训练参数量）
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"\nTotal Parameters: {total_params:,}")
-    print(f"Trainable Parameters: {trainable_params:,}")
-    print("============")
 
     loss_func, center_criterion = make_loss(cfg, num_classes=num_classes)
 
