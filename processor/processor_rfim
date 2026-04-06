@@ -1,0 +1,431 @@
+import logging
+import os
+import time
+
+import numpy as np
+import torch
+import torch.nn as nn
+# from utils.meter import AverageMeter
+# from utils.metrics import R1_mAP_eval
+from torch.cuda import amp
+import torch.distributed as dist
+
+#+++++++++++++++++++++++++++
+class AverageMeter(object):
+    """Computes and stores the average and current value"""
+
+    def __init__(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
+def re_ranking(probFea, galFea, k1, k2, lambda_value, local_distmat=None, only_local=False):
+    # if feature vector is numpy, you should use 'torch.tensor' transform it to tensor
+    query_num = probFea.size(0)
+    all_num = query_num + galFea.size(0)
+    if only_local:
+        original_dist = local_distmat
+    else:
+        feat = torch.cat([probFea, galFea])
+        # print('using GPU to compute original distance')
+        distmat = torch.pow(feat, 2).sum(dim=1, keepdim=True).expand(all_num, all_num) + \
+                  torch.pow(feat, 2).sum(dim=1, keepdim=True).expand(all_num, all_num).t()
+        distmat.addmm_(1, -2, feat, feat.t())
+        original_dist = distmat.cpu().numpy()
+        del feat
+        if not local_distmat is None:
+            original_dist = original_dist + local_distmat
+    gallery_num = original_dist.shape[0]
+    original_dist = np.transpose(original_dist / np.max(original_dist, axis=0))
+    V = np.zeros_like(original_dist).astype(np.float16)
+    initial_rank = np.argsort(original_dist).astype(np.int32)
+
+    # print('starting re_ranking')
+    for i in range(all_num):
+        # k-reciprocal neighbors
+        forward_k_neigh_index = initial_rank[i, :k1 + 1]
+        backward_k_neigh_index = initial_rank[forward_k_neigh_index, :k1 + 1]
+        fi = np.where(backward_k_neigh_index == i)[0]
+        k_reciprocal_index = forward_k_neigh_index[fi]
+        k_reciprocal_expansion_index = k_reciprocal_index
+        for j in range(len(k_reciprocal_index)):
+            candidate = k_reciprocal_index[j]
+            candidate_forward_k_neigh_index = initial_rank[candidate, :int(np.around(k1 / 2)) + 1]
+            candidate_backward_k_neigh_index = initial_rank[candidate_forward_k_neigh_index,
+                                               :int(np.around(k1 / 2)) + 1]
+            fi_candidate = np.where(candidate_backward_k_neigh_index == candidate)[0]
+            candidate_k_reciprocal_index = candidate_forward_k_neigh_index[fi_candidate]
+            if len(np.intersect1d(candidate_k_reciprocal_index, k_reciprocal_index)) > 2 / 3 * len(
+                    candidate_k_reciprocal_index):
+                k_reciprocal_expansion_index = np.append(k_reciprocal_expansion_index, candidate_k_reciprocal_index)
+
+        k_reciprocal_expansion_index = np.unique(k_reciprocal_expansion_index)
+        weight = np.exp(-original_dist[i, k_reciprocal_expansion_index])
+        V[i, k_reciprocal_expansion_index] = weight / np.sum(weight)
+    original_dist = original_dist[:query_num, ]
+    if k2 != 1:
+        V_qe = np.zeros_like(V, dtype=np.float16)
+        for i in range(all_num):
+            V_qe[i, :] = np.mean(V[initial_rank[i, :k2], :], axis=0)
+        V = V_qe
+        del V_qe
+    del initial_rank
+    invIndex = []
+    for i in range(gallery_num):
+        invIndex.append(np.where(V[:, i] != 0)[0])
+
+    jaccard_dist = np.zeros_like(original_dist, dtype=np.float16)
+
+    for i in range(query_num):
+        temp_min = np.zeros(shape=[1, gallery_num], dtype=np.float16)
+        indNonZero = np.where(V[i, :] != 0)[0]
+        indImages = [invIndex[ind] for ind in indNonZero]
+        for j in range(len(indNonZero)):
+            temp_min[0, indImages[j]] = temp_min[0, indImages[j]] + np.minimum(V[i, indNonZero[j]],
+                                                                               V[indImages[j], indNonZero[j]])
+        jaccard_dist[i] = 1 - temp_min / (2 - temp_min)
+
+    final_dist = jaccard_dist * (1 - lambda_value) + original_dist * lambda_value
+    del original_dist
+    del V
+    del jaccard_dist
+    final_dist = final_dist[:query_num, query_num:]
+    return final_dist
+
+def euclidean_distance(qf, gf):
+    m = qf.shape[0]
+    n = gf.shape[0]
+    dist_mat = torch.pow(qf, 2).sum(dim=1, keepdim=True).expand(m, n) + \
+               torch.pow(gf, 2).sum(dim=1, keepdim=True).expand(n, m).t()
+    dist_mat.addmm_(1, -2, qf, gf.t())
+    return dist_mat.cpu().numpy()
+
+def eval_func(distmat, q_pids, g_pids, q_camids, g_camids, max_rank=50):
+    """Evaluation with market1501 metric
+        Key: for each query identity, its gallery images from the same camera view are discarded.
+        """
+    num_q, num_g = distmat.shape
+    # distmat g
+    #    q    1 3 2 4
+    #         4 1 2 3
+    if num_g < max_rank:
+        max_rank = num_g
+        print("Note: number of gallery samples is quite small, got {}".format(num_g))
+    indices = np.argsort(distmat, axis=1)
+    #  0 2 1 3
+    #  1 2 3 0
+    matches = (g_pids[indices] == q_pids[:, np.newaxis]).astype(np.int32)
+    # compute cmc curve for each query
+    all_cmc = []
+    all_AP = []
+    num_valid_q = 0.  # number of valid query
+    for q_idx in range(num_q):
+        # get query pid and camid
+        q_pid = q_pids[q_idx]
+        q_camid = q_camids[q_idx]
+
+        # remove gallery samples that have the same pid and camid with query
+        order = indices[q_idx]  # select one row
+        remove = (g_pids[order] == q_pid) & (g_camids[order] == q_camid)
+        keep = np.invert(remove)
+
+        # compute cmc curve
+        # binary vector, positions with value 1 are correct matches
+        orig_cmc = matches[q_idx][keep]
+        if not np.any(orig_cmc):
+            # this condition is true when query identity does not appear in gallery
+            continue
+
+        cmc = orig_cmc.cumsum()
+        cmc[cmc > 1] = 1
+
+        all_cmc.append(cmc[:max_rank])
+        num_valid_q += 1.
+
+        # compute average precision
+        # reference: https://en.wikipedia.org/wiki/Evaluation_measures_(information_retrieval)#Average_precision
+        num_rel = orig_cmc.sum()
+        tmp_cmc = orig_cmc.cumsum()
+        #tmp_cmc = [x / (i + 1.) for i, x in enumerate(tmp_cmc)]
+        y = np.arange(1, tmp_cmc.shape[0] + 1) * 1.0
+        tmp_cmc = tmp_cmc / y
+        tmp_cmc = np.asarray(tmp_cmc) * orig_cmc
+        AP = tmp_cmc.sum() / num_rel
+        all_AP.append(AP)
+
+    assert num_valid_q > 0, "Error: all query identities do not appear in gallery"
+
+    all_cmc = np.asarray(all_cmc).astype(np.float32)
+    all_cmc = all_cmc.sum(0) / num_valid_q
+    mAP = np.mean(all_AP)
+
+    return all_cmc, mAP
+
+class R1_mAP_eval():
+    def __init__(self, num_query, max_rank=50, feat_norm=True, reranking=False):
+        super(R1_mAP_eval, self).__init__()
+        self.num_query = num_query
+        self.max_rank = max_rank
+        self.feat_norm = feat_norm
+        self.reranking = reranking
+
+    def reset(self):
+        self.feats = []
+        self.pids = []
+        self.camids = []
+
+    def update(self, output):  # called once for each batch
+        feat, pid, camid = output
+        self.feats.append(feat.cpu())
+        self.pids.extend(np.asarray(pid))
+        self.camids.extend(np.asarray(camid))
+
+    def compute(self):  # called after each epoch
+        feats = torch.cat(self.feats, dim=0)
+        if self.feat_norm:
+            print("The test feature is normalized")
+            feats = torch.nn.functional.normalize(feats, dim=1, p=2)  # along channel
+        # query
+        qf = feats[:self.num_query]
+        q_pids = np.asarray(self.pids[:self.num_query])
+        q_camids = np.asarray(self.camids[:self.num_query])
+        # gallery
+        gf = feats[self.num_query:]
+        g_pids = np.asarray(self.pids[self.num_query:])
+
+        g_camids = np.asarray(self.camids[self.num_query:])
+        if self.reranking:
+            print('=> Enter reranking')
+            # distmat = re_ranking(qf, gf, k1=20, k2=6, lambda_value=0.3)
+            distmat = re_ranking(qf, gf, k1=50, k2=15, lambda_value=0.3)
+
+        else:
+            print('=> Computing DistMat with euclidean_distance')
+            distmat = euclidean_distance(qf, gf)
+        cmc, mAP = eval_func(distmat, q_pids, g_pids, q_camids, g_camids)
+
+        return cmc, mAP, distmat, self.pids, self.camids, qf, gf
+
+#-------------------------
+
+def do_train(
+    cfg,
+    model,
+    center_criterion,
+    train_loader,
+    val_loader,
+    optimizer,
+    optimizer_center,
+    scheduler,
+    loss_fn,
+    num_query,
+    local_rank,
+):
+    log_period = cfg.SOLVER.LOG_PERIOD
+    checkpoint_period = cfg.SOLVER.CHECKPOINT_PERIOD
+    eval_period = cfg.SOLVER.EVAL_PERIOD
+
+    device = "cuda"
+    epochs = cfg.SOLVER.MAX_EPOCHS
+
+    logger = logging.getLogger("tat.train")
+    logger.info("start training")
+    _LOCAL_PROCESS_GROUP = None
+    if device:
+        model.to(local_rank)
+        if torch.cuda.device_count() > 1 and cfg.MODEL.DIST_TRAIN:
+            print("Using {} GPUs for training".format(torch.cuda.device_count()))
+            model = torch.nn.parallel.DistributedDataParallel(
+                model, device_ids=[local_rank], find_unused_parameters=True
+            )
+
+    loss_meter = AverageMeter()
+    acc_meter = AverageMeter()
+
+    evaluator = R1_mAP_eval(num_query, max_rank=50, feat_norm=cfg.TEST.FEAT_NORM)
+    scaler = amp.GradScaler()
+    # train
+    for epoch in range(1, epochs + 1):
+        start_time = time.time()
+        loss_meter.reset()
+        acc_meter.reset()
+        evaluator.reset()
+        scheduler.step(epoch)
+        model.train()
+
+        for n_iter, (img, vid, target_cam, target_view) in enumerate(train_loader):
+            optimizer.zero_grad()
+            optimizer_center.zero_grad()
+            img = img.to(device)
+            target = vid.to(device)
+            target_cam = target_cam.to(device)
+            target_view = target_view.to(device)
+            with amp.autocast(enabled=True):
+                score, feat = model(
+                    img, target, cam_label=target_cam, view_label=target_view
+                )
+                loss = loss_fn(score, feat, target, target_cam)
+
+            scaler.scale(loss).backward()
+
+            scaler.step(optimizer)
+            scaler.update()
+
+            if (n_iter + 1) % log_period == 0:
+                logger.info(
+                    "Epoch[{}] Iteration[{}/{}] Loss: {:.3f}, Acc: {:.3f}, Base Lr: {:.2e}".format(
+                        epoch,
+                        (n_iter + 1),
+                        len(train_loader),                                                                    
+                        loss_meter.avg,
+                        acc_meter.avg,
+                        scheduler._get_lr(epoch)[0],
+                    )
+                )
+            # score = torch.mean(score, dim=2)  # [64, 751]
+            # print(f"reverse score.shape = {score.shape}")  # [64,751]
+            # print(f"target.shape = {target.shape}") #[64]
+
+            # #+2222222+xx++++++++++++++
+            # # 方案：直接取最后一个时间步的输出（适用于序列分类）
+            score = score[:, -1, :]  # [64, 751]  循环输出
+            # print(f"score.shape = {score.shape}")
+            # #-------------
+            if isinstance(score, list):
+                acc = (score[0].max(1)[1] == target).float().mean()
+            else:
+                acc = (score.max(1)[1] == target).float().mean()
+
+            loss_meter.update(loss.item(), img.shape[0])
+            acc_meter.update(acc, 1)
+
+            torch.cuda.synchronize()
+            # if (n_iter + 1) % log_period == 0:
+            #     logger.info(
+            #         "Epoch[{}] Iteration[{}/{}] Loss: {:.3f}, Acc: {:.3f}, Base Lr: {:.2e}".format(
+            #             epoch,
+            #             (n_iter + 1),
+            #             len(train_loader),
+            #             loss_meter.avg,
+            #             acc_meter.avg,
+            #             scheduler._get_lr(epoch)[0],
+            #         )
+            #     )
+
+        end_time = time.time()
+        time_per_batch = (end_time - start_time) / (n_iter + 1)
+        if cfg.MODEL.DIST_TRAIN:
+            pass
+        else:
+            logger.info(
+                "Epoch {} done. Time per batch: {:.3f}[s] Speed: {:.1f}[samples/s]".format(
+                    epoch, time_per_batch, train_loader.batch_size / time_per_batch
+                )
+            )
+
+        if epoch % checkpoint_period == 0:
+            if cfg.MODEL.DIST_TRAIN:
+                if dist.get_rank() == 0:
+                    torch.save(
+                        model.state_dict(),
+                        os.path.join(
+                            cfg.OUTPUT_DIR, cfg.MODEL.NAME + "_{}.pth".format(epoch)
+                        ),
+                    )
+            else:
+                torch.save(
+                    model.state_dict(),
+                    os.path.join(
+                        cfg.OUTPUT_DIR, cfg.MODEL.NAME + "_{}.pth".format(epoch)
+                    ),
+                )
+
+        if epoch % eval_period == 0:
+            if cfg.MODEL.DIST_TRAIN:
+                if dist.get_rank() == 0:
+                    model.eval()
+                    for n_iter, (img, vid, camid, camids, target_view, _) in enumerate(
+                        val_loader
+                    ):
+                        with torch.no_grad():
+                            img = img.to(device)
+                            camids = camids.to(device)
+                            target_view = target_view.to(device)
+                            feat = model(img, cam_label=camids, view_label=target_view)
+                            evaluator.update((feat, vid, camid))
+                    cmc, mAP, _, _, _, _, _ = evaluator.compute()
+                    logger.info("Validation Results - Epoch: {}".format(epoch))
+                    logger.info("mAP: {:.1%}".format(mAP))
+                    for r in [1, 5, 10]:
+                        logger.info(
+                            "CMC curve, Rank-{:<3}:{:.1%}".format(r, cmc[r - 1])
+                        )
+                    torch.cuda.empty_cache()
+            else:
+                model.eval()
+                for n_iter, (img, vid, camid, camids, target_view, _) in enumerate(
+                    val_loader
+                ):
+                    with torch.no_grad():
+                        img = img.to(device)
+                        camids = camids.to(device)
+                        target_view = target_view.to(device)
+                        feat = model(img, cam_label=camids, view_label=target_view)
+                        evaluator.update((feat, vid, camid))
+                cmc, mAP, _, _, _, _, _ = evaluator.compute()
+                logger.info("Validation Results - Epoch: {}".format(epoch))
+                logger.info("mAP: {:.1%}".format(mAP))
+                for r in [1, 5, 10]:
+                    logger.info("CMC curve, Rank-{:<3}:{:.1%}".format(r, cmc[r - 1]))
+                torch.cuda.empty_cache()
+
+
+def do_inference(cfg, model, val_loader, num_query):
+    device = "cuda"
+    logger = logging.getLogger("tat.test")
+    logger.info("Enter inferencing")
+
+    evaluator = R1_mAP_eval(num_query, max_rank=50, feat_norm=cfg.TEST.FEAT_NORM)
+
+    evaluator.reset()
+
+    if device:
+        if torch.cuda.device_count() > 1:
+            print("Using {} GPUs for inference".format(torch.cuda.device_count()))
+            model = nn.DataParallel(model)
+        model.to(device)
+
+    model.eval()
+    img_path_list = []
+
+    for n_iter, (img, pid, camid, camids, target_view, imgpath) in enumerate(
+        val_loader
+    ):
+        with torch.no_grad():
+            img = img.to(device)
+            camids = camids.to(device)
+            target_view = target_view.to(device)
+            feat = model(img, cam_label=camids, view_label=target_view)
+            evaluator.update((feat, pid, camid))
+            img_path_list.extend(imgpath)
+
+    cmc, mAP, _, _, _, _, _ = evaluator.compute()
+    logger.info("Validation Results ")
+    logger.info("mAP: {:.1%}".format(mAP))
+    for r in [1, 5, 10]:
+        logger.info("CMC curve, Rank-{:<3}:{:.1%}".format(r, cmc[r - 1]))
+    return cmc[0], cmc[4]
+
